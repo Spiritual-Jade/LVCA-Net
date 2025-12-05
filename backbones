@@ -1,0 +1,237 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import Tensor
+from typing import List, Optional
+
+from mmcv.ops import (
+    SparseConv3d,
+    SparseConvTensor,
+    SparseInverseConv3d,
+    SubMConv3d as mmcv_SubMConv3d
+)
+from mmcv.cnn import build_norm_layer, build_activation_layer
+from mmengine.model import BaseModule
+from mmdet3d.registry import MODELS
+from mmdet3d.utils import ConfigType
+
+
+class SepSubMConv3d(BaseModule):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size=(3, 3, 3),
+                 padding=(1, 1, 1),
+                 mid_ratio: float = 0.5,
+                 norm_cfg: ConfigType = dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 act_cfg: ConfigType = dict(type='LeakyReLU'),
+                 indice_key: Optional[str] = None):
+        super().__init__()
+        mid = max(8, int(in_channels * mid_ratio))
+        self.pw1 = mmcv_SubMConv3d(
+            in_channels, mid, kernel_size=1, bias=False,
+            indice_key=(indice_key + '_pw1') if indice_key else None
+        )
+        self.bn1 = build_norm_layer(norm_cfg, mid)[1]
+        self.act1 = build_activation_layer(act_cfg)
+        self.dw = mmcv_SubMConv3d(
+            mid, mid, kernel_size=kernel_size, padding=padding, bias=False,
+            indice_key=indice_key
+        )
+        self.bn2 = build_norm_layer(norm_cfg, mid)[1]
+        self.act2 = build_activation_layer(act_cfg)
+        self.pw2 = mmcv_SubMConv3d(
+            mid, out_channels, kernel_size=1, bias=False,
+            indice_key=(indice_key + '_pw2') if indice_key else None
+        )
+        self.bn3 = build_norm_layer(norm_cfg, out_channels)[1]
+        self.act3 = build_activation_layer(act_cfg)
+
+    def forward(self, x: SparseConvTensor):
+        out = self.pw1(x)
+        out.features = self.act1(self.bn1(out.features))
+        out = self.dw(out)
+        out.features = self.act2(self.bn2(out.features))
+        out = self.pw2(out)
+        out.features = self.act3(self.bn3(out.features))
+        return out
+
+
+class LiteAsymmResBlock(BaseModule):
+    def __init__(self,
+                 in_c: int,
+                 out_c: int,
+                 norm_cfg: ConfigType,
+                 act_cfg: ConfigType = dict(type='LeakyReLU'),
+                 indice_key: Optional[str] = None):
+        super().__init__()
+        ik = indice_key or 'lasym'
+        self.branch_a1 = SepSubMConv3d(
+            in_c, out_c, kernel_size=(1, 3, 3), padding=(0, 1, 1),
+            mid_ratio=0.5, norm_cfg=norm_cfg, act_cfg=act_cfg, indice_key=ik + '_a1'
+        )
+        self.branch_a2 = SepSubMConv3d(
+            out_c, out_c, kernel_size=(3, 1, 3), padding=(1, 0, 1),
+            mid_ratio=0.5, norm_cfg=norm_cfg, act_cfg=act_cfg, indice_key=ik + '_a2'
+        )
+        self.branch_b1 = SepSubMConv3d(
+            in_c, out_c, kernel_size=(3, 1, 3), padding=(1, 0, 1),
+            mid_ratio=0.5, norm_cfg=norm_cfg, act_cfg=act_cfg, indice_key=ik + '_b1'
+        )
+        self.branch_b2 = SepSubMConv3d(
+            out_c, out_c, kernel_size=(1, 3, 3), padding=(0, 1, 1),
+            mid_ratio=0.5, norm_cfg=norm_cfg, act_cfg=act_cfg, indice_key=ik + '_b2'
+        )
+        self.proj = None
+        if in_c != out_c:
+            self.proj = mmcv_SubMConv3d(in_c, out_c, kernel_size=1, bias=False, indice_key=ik + '_proj')
+            self.pbn = build_norm_layer(norm_cfg, out_c)[1]
+
+    def forward(self, x: SparseConvTensor):
+        a = self.branch_a2(self.branch_a1(x))
+        b = self.branch_b2(self.branch_b1(x))
+        res = x
+        if self.proj is not None:
+            res = self.proj(res)
+            res.features = self.pbn(res.features)
+        return a.replace_feature(a.features + b.features + res.features)
+
+
+class LiteDown(BaseModule):
+    def __init__(self,
+                 in_c: int,
+                 out_c: int,
+                 norm_cfg: ConfigType,
+                 act_cfg: ConfigType = dict(type='LeakyReLU'),
+                 stride=(2, 2, 1),
+                 indice_key: Optional[str] = None):
+        super().__init__()
+        self.body = LiteAsymmResBlock(in_c, out_c, norm_cfg, act_cfg, indice_key=(indice_key or 'd_body'))
+        self.pool = SparseConv3d(
+            out_c, out_c, kernel_size=3, stride=stride, padding=1,
+            bias=False, indice_key=(indice_key or 'd_pool')
+        )
+
+    def forward(self, x: SparseConvTensor):
+        y = self.body(x)
+        yds = self.pool(y)
+        return yds, y
+
+
+class LiteUp(BaseModule):
+    def __init__(self,
+                 in_c: int,
+                 out_c: int,
+                 norm_cfg: ConfigType,
+                 act_cfg: ConfigType = dict(type='LeakyReLU'),
+                 up_key: Optional[str] = None,
+                 indice_key: Optional[str] = None):
+        super().__init__()
+        self.up = SparseInverseConv3d(in_c, out_c, kernel_size=3, indice_key=up_key, bias=False)
+        self.fuse = LiteAsymmResBlock(out_c, out_c, norm_cfg, act_cfg, indice_key=(indice_key or 'u_fuse'))
+
+    def forward(self, x: SparseConvTensor, skip: SparseConvTensor):
+        x = self.up(x)
+        x.features = x.features + skip.features
+        return self.fuse(x)
+
+
+class TCGALite(BaseModule):
+    def __init__(self, channels: int, num_groups: int = 4, reduction: int = 4):
+        super().__init__()
+        assert channels % num_groups == 0
+        self.g = num_groups
+        self.gc = channels // num_groups
+        hidden = max(8, channels // reduction)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.gc + 3, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, self.gc, bias=True),
+            nn.Sigmoid()
+        )
+
+    @torch.no_grad()
+    def _coord_embed(self, indices: Tensor, spatial_shape: Tensor) -> Tensor:
+        eps = 1e-6
+        z = indices[:, 1].float() / (float(spatial_shape[0].item()) - 1.0 + eps)
+        y = indices[:, 2].float() / (float(spatial_shape[1].item()) - 1.0 + eps)
+        x = indices[:, 3].float() / (float(spatial_shape[2].item()) - 1.0 + eps)
+        cx = x - 0.5
+        cy = y - 0.5
+        r = torch.sqrt(cx * cx + cy * cy)
+        theta = torch.atan2(cy, cx) / np.pi
+        return torch.stack([r, theta, z], dim=1)
+
+    def forward(self, x: SparseConvTensor) -> SparseConvTensor:
+        N, C = x.features.shape
+        F = x.features
+        device = F.device
+        spatial_shape = torch.tensor(x.spatial_shape, device=device, dtype=torch.long)
+        coords = self._coord_embed(x.indices, spatial_shape)
+        Fg = F.view(N, self.g, self.gc)
+        gates = []
+        for g in range(self.g):
+            inp = torch.cat([Fg[:, g, :], coords], dim=1)
+            gate = self.mlp(inp)
+            gates.append(gate)
+        G = torch.stack(gates, dim=1)
+        Fout = (Fg * G).reshape(N, C)
+        return x.replace_feature(Fout)
+
+
+@MODELS.register_module()
+class LiteAsymm3D(BaseModule):
+    def __init__(self,
+                 grid_size: List[int],
+                 input_channels: int,
+                 base_channels: int = 16,
+                 depth: int = 4,
+                 down_strides: Optional[List[tuple]] = None,
+                 norm_cfg: ConfigType = dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 init_cfg=None):
+        super().__init__(init_cfg)
+        self.grid_size = grid_size
+        self.stem = LiteAsymmResBlock(
+            input_channels, base_channels, norm_cfg, indice_key='stem'
+        )
+        if down_strides is None:
+            down_strides = [(2, 2, 1)] * depth
+        ch = [base_channels * (2 ** i) for i in range(depth + 1)]
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        for i in range(depth):
+            self.downs.append(
+                LiteDown(ch[i], ch[i + 1], norm_cfg,
+                         stride=down_strides[i], indice_key=f'down{i}')
+            )
+        for i in range(depth - 1, -1, -1):
+            self.ups.append(
+                LiteUp(ch[i + 1], ch[i], norm_cfg, up_key=f'down{i}', indice_key=f'up{i}')
+            )
+        self.tcga = TCGALite(ch[0], num_groups=4, reduction=4)
+        self.neck = SepSubMConv3d(
+            ch[0], ch[0], kernel_size=(3, 3, 3), padding=1,
+            mid_ratio=0.5, norm_cfg=norm_cfg, indice_key='neck'
+        )
+
+    def forward(self,
+                voxel_features: Tensor,
+                coors: Tensor,
+                batch_size: int) -> SparseConvTensor:
+        x = SparseConvTensor(
+            voxel_features, coors.int(),
+            np.array(self.grid_size, dtype=np.int32), batch_size
+        )
+        y = self.stem(x)
+        skips = []
+        for d in self.downs:
+            y, s = d(y)
+            skips.append(s)
+        for i, u in enumerate(self.ups):
+            y = u(y, skips[-1 - i])
+        y = self.tcga(y)
+        y = self.neck(y)
+        return y
+
+
+
